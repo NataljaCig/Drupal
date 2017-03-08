@@ -1,0 +1,9 @@
+
+.commerce-icepaybasic-info {
+    background-image:url('../images/icepay_basic.png');
+    background-position:left top;
+    background-repeat: no-repeat;
+    padding-left: 200px;
+    height: 50px;
+    padding-top: 10px;
+}

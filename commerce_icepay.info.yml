@@ -1,0 +1,18 @@
+name: 'ICEPAY Payment Module'
+description: 'Enable payments using ICEPAY global payments'
+package: 'Commerce (ICEPAY)'
+
+type: module
+core: 8.x
+project: 'commerce_icepay'
+
+#version: 0.01
+
+
+#configure = my_module.admin
+
+dependencies:
+        #- commerce
+          #        - commerce_ui
+        - commerce_payment
+        #- commerce_order
