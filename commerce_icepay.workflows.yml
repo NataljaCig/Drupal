@@ -1,0 +1,49 @@
+payment_icepay:
+  id: payment_icepay
+  group: commerce_icepay
+  label: 'Default'
+  states:
+    icepay_new:
+      label: 'New'
+    icepay_open:
+      label: 'Open'
+    icepay_ok:
+      label: 'OK'
+    icepay_error:
+      label: 'Error'
+    icepay_refund:
+      label: 'Refund'
+    icepay_cback:
+      label: 'Chargeback'
+
+  transitions:
+    # Transitions are required by the state_machine module,
+    # but aren't actually used by the payment API.
+    complete_new:
+      label: 'Complete'
+      from: [icepay_new]
+      to: icepay_ok
+    complete_open:
+      label: 'Complete'
+      from: [icepay_open]
+      to: icepay_ok
+    set_open:
+      label: 'Open'
+      from: [icepay_new]
+      to: icepay_open
+    cancel_open:
+      label: 'Cancel'
+      from: [icepay_open]
+      to: icepay_error
+    cancel_new:
+      label: 'Cancel'
+      from: [icepay_new]
+      to: icepay_error
+    refund:
+      label: 'Refund'
+      from: [icepay_ok]
+      to: icepay_refund
+    chargeback:
+      label: 'Chargeback'
+      from: [icepay_ok]
+      to: icepay_cback

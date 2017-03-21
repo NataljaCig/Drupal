@@ -30,10 +30,7 @@ require_once(dirname(__FILE__) . '/../../../Api/icepay_api_basic.php');
  *    forms = {
  *     "offsite-payment" = "Drupal\commerce_icepay\PluginForm\IcepayCheckoutForm",
  *   },
- *   payment_method_types = {"credit_card"},
- *   credit_card_types = {
- *     "amex", "discover", "mastercard", "visa",
- *   },
+ *   payment_method_types = {"icepay"},
  * )
  */
 class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckoutInterface
@@ -52,6 +49,8 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
      * @var \Drupal\commerce_price\RounderInterface
      */
     protected $rounder;
+
+    protected $paymentType = 'payment_icepay';
 
     /**
      * {@inheritdoc}
@@ -128,6 +127,7 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
             '#default_value' => ''
         ];
 
+
         $form['icepay_postback_url'] = [
             '#type' => 'textfield',
             '#attributes' => array('readonly' => 'readonly'),
@@ -188,6 +188,86 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
 
     }
 
+    /**
+     * {@inheritdoc}
+     */
+    public function onNotify(Request $request)
+    {
+
+        if ($request->getMethod() === 'GET') {
+            echo "process url ok";
+        } else if ($request->getMethod() === 'POST') {
+
+            $icepay = new \Icepay_Postback();
+
+            $configuration = $this->getConfiguration();
+            $icepay->setMerchantID($configuration['icepay_merchant_id'])->setSecretCode($configuration['icepay_secret_code']);
+
+
+            try {
+
+                if ($icepay->validate()) {
+
+                    $payment_storage = $this->entityTypeManager->getStorage('commerce_payment');
+                    /** @var PaymentInterface[] $payments */
+                    $icepay_payment = $payment_storage->load($icepay->getOrderID());
+                    if (!isset($icepay_payment) || $icepay_payment->bundle() != 'payment_icepay') {
+                        throw new PaymentGatewayException("ICEPAY payment not found");
+                    }
+
+                    $order = $icepay_payment->getOrder();
+                    if ($order->id !== $icepay_payment->getReference || 0 !== $icepay_payment->getAmount()->compareTo($order->getTotalPrice())) {
+                        throw new PaymentGatewayException("Error!"); //TODO
+                    }
+
+                    if (!$icepay_payment->getRemoteState() || ($icepay_payment->getRemoteState() !== $icepay->getStatus() && $icepay->canUpdateStatus($icepay_payment->getRemoteState(), $icepay->getStatus()))) {
+
+                        $state = $icepay_payment->getState();
+                        $stateValue = $state->getValue();
+                        $currentStateName = end($stateValue);
+                        $workflow = $state->getWorkflow();
+                        $transition = $workflow->getTransition('cancel_new');
+
+                        if ($currentStateName === 'icepay_new') {
+                            switch ($icepay->getStatus()) {
+                                case \Icepay_StatusCode::OPEN:
+                                    $transition = $workflow->getTransition('set_open');
+                                    break;
+                                case \Icepay_StatusCode::SUCCESS:
+                                    $transition = $workflow->getTransition('complete_new');
+                                    break;
+                                case \Icepay_StatusCode::ERROR:
+                                    $transition = $workflow->getTransition('cancel_new');
+                                    break;
+                            }
+                        } else if ($currentStateName === 'icepay_open') {
+                            switch ($icepay->getStatus()) {
+                                case \Icepay_StatusCode::SUCCESS:
+                                    $transition = $workflow->getTransition('complete_new');
+                                    break;
+                                case \Icepay_StatusCode::ERROR:
+                                    $transition = $workflow->getTransition('cancel_new');
+                                    break;
+                            }
+                        } else throw new PaymentGatewayException("Refund and chagreback not supported");
+
+                        $icepay_payment->getState()->applyTransition($transition);
+                        $icepay_payment->setRemoteId($icepay->getOrderID());
+                        $icepay_payment->setRemoteState($icepay->getStatus());
+                        $icepay_payment->save();
+                    }
+
+                } else {
+                    throw new PaymentGatewayException("Failed to validate payment geatway response");
+                }
+
+            } catch
+            (Exception $e) {
+                throw new PaymentGatewayException($e->getMessage(), $e->getCode(), $e);
+            }
+        }
+    }
+
     private function processIcepayResponse(OrderInterface $order, Request $request, $isCanceled = false)
     {
         $icepay = new \Icepay_Result();
@@ -200,75 +280,94 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
             if ($icepay->validate()) {
 
                 $payment_storage = $this->entityTypeManager->getStorage('commerce_payment');
-                $request_time = \Drupal::service('commerce.time')->getRequestTime();
                 $resultData = $icepay->getResultData();
 
                 if ($order->id() !== $resultData->reference) {
                     throw new PaymentGatewayException("Wrong order ID");
                 }
 
-                $payment = $payment_storage->create([
-                    'state' => 'Open',
-                    'amount' => $order->getTotalPrice(),
-                    'payment_gateway' => $this->entityId,
-                    'order_id' => $order->id(),
-                    'test' => $this->getMode() == 'test',
-                    'remote_id' => $resultData->paymentID,
-                    'remote_state' => $resultData->status,
-                    'authorized' => $request_time,
-                ]);
+                /** @var PaymentInterface[] $payments */
+                $payments = $payment_storage->loadByProperties(['order_id' => $order->id()]);
+                if ($payments) {
+                    foreach ($payments as $payment) {
+                        if ($payment->id() == $resultData->orderID && 0 === $payment->getAmount()->compareTo($order->getTotalPrice())) {
+                            $icepay_payment = $payment;
+                        }
+                    }
+                }
 
+                if (!isset($icepay_payment) || $icepay_payment->bundle() != 'payment_icepay') {
+                    throw new PaymentGatewayException("ICEPAY payment not found");
+                }
 
-                switch ($icepay->getStatus()) {
-                    case \Icepay_StatusCode::OPEN:
+                if (!$icepay_payment->getRemoteState() || ($icepay_payment->getRemoteState() !== $icepay->getStatus() && $this->canUpdateIcepayStatus($order->getData('icepay_status'), $icepay->getStatus()))) {
 
-                        //Can happen in test mode if payment method does not allow "OPEN" state.
-                        if ($isCanceled) {
-                            throw new PaymentGatewayException("Order " . $resultData->reference . " failed. " . $resultData->statusCode);
+                    $state = $icepay_payment->getState();
+                    $stateValue = $state->getValue();
+                    $currentStateName = end($stateValue);
+                    $workflow = $state->getWorkflow();
+
+                    if ($currentStateName === 'icepay_new') {
+                        $transition = $workflow->getTransition('cancel_new');
+
+                        switch ($icepay->getStatus()) {
+                            case \Icepay_StatusCode::OPEN:
+                                //Can happen in test mode if payment method does not allow "OPEN" state.
+                                if (!$isCanceled) {
+                                    $transition = $workflow->getTransition('set_open');
+                                }
+                                break;
+                            case \Icepay_StatusCode::SUCCESS:
+                                $transition = $workflow->getTransition('complete_new');
+                                break;
+                            case \Icepay_StatusCode::ERROR:
+                                // Order canceled by the user
+                                if ($resultData->statusCode === "Cancelled") {
+                                    drupal_set_message($this->t('You have canceled checkout at @gateway but may resume the checkout process here when you are ready.', [
+                                        '@gateway' => $this->getDisplayLabel(),
+                                    ]));
+                                    $icepay_payment->delete();
+                                    return;
+                                }
+//                            $transition = $workflow->getTransition('cancel_new');
+                                break;
                         }
 
-                        // $payment->state = 'Open';
-                        break;
-                    case \Icepay_StatusCode::SUCCESS:
-                        $payment->state = 'Success';
-                        break;
-                    case \Icepay_StatusCode::ERROR:
+                    } else if ($currentStateName === 'icepay_open') {
+                        $transition = $workflow->getTransition('cancel_open');
 
-                        // Order canceled by the user
-                        if ($isCanceled) {
-                            drupal_set_message($this->t('You have canceled checkout at @gateway but may resume the checkout process here when you are ready.', [
-                                '@gateway' => $this->getDisplayLabel(),
-                            ]));
-                            return;
+                        switch ($icepay->getStatus()) {
+                            case \Icepay_StatusCode::SUCCESS:
+                                $transition = $workflow->getTransition('complete_open');
+                                break;
+                            case \Icepay_StatusCode::ERROR:
+                                //$transition = $workflow->getTransition('cancel_open');
+                                break;
+
                         }
+                    } else throw new PaymentGatewayException("Invalid payment state");
 
-                        $payment->state = 'Error';
-                        $payment->save();
+                    if ($icepay->getStatus() == \Icepay_StatusCode::ERROR || $isCanceled) {
                         throw new PaymentGatewayException("Order " . $resultData->reference . " failed. " . $resultData->statusCode);
-                        break;
+                    }
+
+                    $icepay_payment->getState()->applyTransition($transition);
+                    $icepay_payment->setRemoteId($icepay->getOrderID());
+                    $icepay_payment->setRemoteState($icepay->getStatus());
+
+                    $icepay_payment->save();
                 }
-
-                if (!$order->getData('icepay_status') || $this->canUpdateIcepayStatus($order->getData('icepay_status'), $icepay->getStatus())) {
-                    $order->setData('icepay_status', $icepay->getStatus());
-                    $order->setData('icepay_result_data', $resultData);
-                    $order->save();
-                    $payment->save();
-                }
-
-
 
             } else {
                 throw new PaymentGatewayException("Failed to validate payment geatway response");
             }
 
-        } catch
-        (Exception $e) {
+        } catch (Exception $e) {
             throw new PaymentGatewayException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
-    private
-    function canUpdateIcepayStatus($currentOrderIcepayStatus, $newOrderIcepayStatus)
+    private function canUpdateIcepayStatus($currentOrderIcepayStatus, $newOrderIcepayStatus)
     {
         switch ($newOrderIcepayStatus) {
             case \Icepay_StatusCode::SUCCESS:
@@ -287,8 +386,7 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
     /**
      * {@inheritdoc}
      */
-    public
-    function setIcepayBasicModeCheckout(PaymentInterface $payment, array $extra)
+    public function setIcepayBasicModeCheckout(PaymentInterface $payment, array $extra)
     {
 
         $order = $payment->getOrder();
@@ -298,9 +396,11 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
         $payment_storage = $this->entityTypeManager->getStorage('commerce_payment');
 
         $payment = $payment_storage->create([
-            'state' => 'new',
+            'type' => 'payment_icepay',
+            'state' => 'icepay_new',
             'amount' => $payment->getAmount(),
             'payment_gateway' => $this->entityId,
+            'payment_method' => 'icepay',
             'order_id' => $order->id(),
             'test' => $this->getMode() == 'test'
         ]);
@@ -318,7 +418,7 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
 
         $paymentObj
             ->setOrderID($payment->id())
-            ->setAmount($amount * 100)
+            ->setAmount($amount->getNumber() * 100)
             ->setCountry($store->getAddress()->getCountryCode())
             ->setLanguage(strtoupper($langcode))
             ->setCurrency($amount->getCurrencyCode())
@@ -326,7 +426,6 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
             ->setDescription($order->id());
 
         try {
-            // Merchant Settings
             $basicmode = \Icepay_Basicmode::getInstance();
             $basicmode->setMerchantID($configuration['icepay_merchant_id'])
                 ->setSecretCode($configuration['icepay_secret_code'])
@@ -337,6 +436,7 @@ class IcepayCheckout extends OffsitePaymentGatewayBase implements IcepayCheckout
             return $basicmode->getURL();
 
         } catch (\Exception $e) {
+            //TODO: error message
             drupal_set_message(t($e), 'error');
             return;
         }
